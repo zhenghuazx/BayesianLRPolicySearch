@@ -1,4 +1,4 @@
-# BayesianLRPolicySearch
+# Green Simulation Assisted Policy Search RL
 
 ## This repo includes 
 1. implementation of the model-based policy gradient algorithm with transition model risk; 
