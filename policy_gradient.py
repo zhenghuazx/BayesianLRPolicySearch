@@ -404,18 +404,6 @@ def score_model(chroma, agent, num_tests, seed):
         chroma.posterior_sample_idx = current
     return np.mean(scores), np.std(scores)
 
-def main(chroma, agent, algo, runlength=260, macro=10):
-    reward_result = []
-    test_reward_result = []
-    for batch in range(runlength):
-        reward = run_episode(chroma, agent, int(str(batch) + str(macro)), batch % 100 == 0, 50, algo)
-        chroma.update_posterior_sample()
-        reward_result.append(reward)
-        test_reward = score_model(chroma, agent, 200, int(str(batch) + str(macro)))
-        test_reward_result.append(test_reward)
-        print("iteration: {}, reward: {:0.2f}, test reward: {:0.2f}".format(batch, reward, test_reward))
-
-    return reward_result, test_reward_result
 
 def main2(chroma, agent, algo, runlength=260, macro=10, num_period=2):
     reward_result = []
@@ -428,14 +416,18 @@ def main2(chroma, agent, algo, runlength=260, macro=10, num_period=2):
             reward = run_episode(chroma, agent, int(str(batch) + str(macro) + str(period)), batch % 100 == 0, 50, algo)
             chroma.update_posterior_sample()
             reward_result.append(reward)
-            test_reward = score_model(chroma, agent, 200, int(str(batch) + str(macro) + str(period)))
+            test_reward = score_model(chroma, agent, 200, int(str(batch) + str(macro) + str(period)))[0]
             test_reward_result.append(test_reward)
             print("iteration: {}, reward: {:0.2f}, test reward: {:0.2f}".format(batch, reward, test_reward))
 
     return reward_result, test_reward_result
 
 if __name__ == '__main__':
-    data_size = 100
+    # set up the hyperparameters
+    data_size = 100 # # interactions in each period
+    ni = 50 # # samples generated per iteration
+    kr = 10 # rolling windows size
+    
     chroma = chromatography(data_size=data_size)
     chroma.build_posterior()
     posterior_initial = chroma.posterior
@@ -453,25 +445,30 @@ if __name__ == '__main__':
         chroma.posterior = posterior_initial
         chroma.posterior_sample_idx = np.random.random_integers(1000,3000)
         agent = Agent(3, 10, 0.01, [16])
-        reward_result, test_reward_result = main2(chroma, agent, 'GS-RL', 250, i, 2)
+        agent.rooling_window_length = ni * kr
+        reward_result, test_reward_result = main2(chroma, agent, '', 250, i, 2)
 
         chroma = chromatography(data_size=data_size)
         chroma.posterior = posterior_initial
         chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
         agent = Agent(3, 10, 0.01, [16])
+        agent.rooling_window_length = ni * kr
         reward_result_PG, test_reward_result_PG = main2(chroma, agent, 'PG', 250, i, 2)
 
         chroma = chromatography(data_size=data_size)
         chroma.posterior = posterior_initial
         chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
         agent = Agent(3, 10, 0.01, [16])
+        agent.rooling_window_length = ni * kr
         reward_result_LR, test_reward_result_LR = main2(chroma, agent, 'LR', 250, i, 2)
 
         chroma = chromatography(data_size=data_size)
         chroma.posterior = posterior_initial
         chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
         agent = Agent(3, 10, 0.01, [16])
+        agent.rooling_window_length = ni * kr
         reward_result_true_model, test_reward_result_true_model = main2(chroma, agent, 'true_model', 250, i, 2)
+
 
         reward_results.append(reward_result)
         test_reward_results.append(test_reward_result)
