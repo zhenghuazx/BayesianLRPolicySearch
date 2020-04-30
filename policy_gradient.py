@@ -9,10 +9,14 @@ from simulation_model import chromatography, fermentation_simulator
 import matplotlib.pyplot as plt
 import pymc3 as pm
 from scipy.stats import beta
+import scipy
+from random import sample
+
+
 
 class Agent(object):
 
-    def __init__(self, input_dim, output_dim, hidden_dims=[16, 32]):
+    def __init__(self, input_dim, output_dim, learning_rate = 0.01, hidden_dims=[16, 32]):
         """Gym Playing Agent
         Args:
             input_dim (int): the dimension of state.
@@ -36,8 +40,8 @@ class Agent(object):
         self.state_size = input_dim
         self.action_size = output_dim
         self.discount_factor = 0.99
-        self.learning_rate = 0.01
-        self.rooling_window_length = 500
+        self.learning_rate = learning_rate
+        self.rolling_window_length = 500
         self.states = []
         self.gradients = []
         self.rewards = []
@@ -45,6 +49,7 @@ class Agent(object):
         self.actions = []
         self.posteriors = []
         self.models = []
+        self._model_hist = self.build_model()
         self.model = self.build_model()
         self.__build_train_fn()
         self.normalizer = 30
@@ -55,7 +60,6 @@ class Agent(object):
         model.add(Dense(16, input_dim=self.state_size, activation='tanh'))
         model.add(Dropout(0.2))
         model.add(Dense(self.action_size, activation='softmax'))
-        # model.add(Dense(self.action_size,input_dim=self.state_size, activation='softmax'))
         model.summary()
         return model
 
@@ -74,28 +78,17 @@ class Agent(object):
         discount_reward_placeholder = K.placeholder(shape=(None,),
                                                     name="discount_reward")
 
-        #likelihood_ratio_placeholder = K.placeholder(shape=(None,),
-        #                                            name="likelihood_ratio")
         action_prob = K.sum(action_onehot_placeholder * self.model.output, axis=1)
         cross_entropy = K.log(action_prob) * discount_reward_placeholder
         loss = -K.mean(cross_entropy)
 
-        # action_prob = K.sum(self.model.output * action_onehot_placeholder, axis=1)
-        # log_action_prob = K.log(action_prob)
-        #
-        #
-        # loss = - log_action_prob * discount_reward_placeholder# * likelihood_ratio_placeholder
-        # loss = K.mean(loss)
-
         adam = optimizers.Adam(lr=self.learning_rate)
 
         updates = adam.get_updates(params=self.model.trainable_weights,
-                                   #constrait=[self.model.output],
                                    loss=loss)
 
         self.train_fn = K.function(inputs=[self.model.input,
                                            action_onehot_placeholder,
-                                           #likelihood_ratio_placeholder,
                                            discount_reward_placeholder],
                                    outputs=[],
                                    updates=updates)
@@ -111,13 +104,6 @@ class Agent(object):
         self.rewards.append(reward)
 
     def get_action(self, state):
-        """Returns an action at given `state`
-        Args:
-            state (1-D or 2-D Array): It can be either 1-D array of shape (state_dimension, )
-                or 2-D array shape of (n_samples, state_dimension)
-        Returns:
-            action: an integer action value ranging from 0 to (n_actions - 1)
-        """
         shape = state.shape
 
         if len(shape) == 1:
@@ -134,8 +120,8 @@ class Agent(object):
         assert len(action_prob) == self.action_size, "{} != {}".format(len(action_prob), self.action_size)
         return np.random.choice(np.arange(self.action_size), p=action_prob), action_prob
 
-    def fit(self, S, A, R, chroma, posterior, action_prob):
-        """Train a network
+    def fit(self, S, A, R, chroma, posterior, normalized_states):
+        """ simple policy gradient (PG)
         Args:
             S (2-D Array): `state` array of shape (n_samples, state_dimension)
             A (1-D Array): `action` array of shape (n_samples,)
@@ -143,79 +129,75 @@ class Agent(object):
             R (1-D Array): `reward` array of shape (n_samples,)
                 A reward is given after each action.
         """
-        discount_reward = compute_discounted_R(R)
+        discount_reward = [0] * len(A)
+        for i in range(len(A)):
+            discount_reward[i] = compute_discounted_R(R[i])
+            normalized_states[i] = normalized_states[i][:-1, ]
 
-        likelihoods = likelihood(chroma.posterior, posterior, S, A)
-        trajectory_dist = [action_prob[i] * likelihoods[i] for i in range(len(likelihoods))] #  np.product(np.append(action_prob,likelihoods))
-        trajectory_dist = compute_forward_ratio(trajectory_dist)
-        mixture_trajectory_dist = 0
-        for hist_idx in range(len(self.actions)):
-            action_probs = self.models[hist_idx].predict(S)
-            mixture_action_prob = [action_probs[step, np.argmax(A[step,])] for step in range(len(A))]
-            mixture_likelihoods = likelihood(chroma.posterior, self.posteriors[int(hist_idx / 100)], S, A) # [likelihood(p, S, A) for p in self.posteriors]
-            mixture_trajectory_dist = [1/len(self.posteriors) * mixture_action_prob[i] * mixture_likelihoods[i] for i in range(len(mixture_likelihoods))]
-            # 1/len(self.posteriors) * np.prod(np.append(mixture_action_prob, mixture_likelihoods))
-            mixture_trajectory_dist = compute_forward_ratio(mixture_trajectory_dist)
+        S = np.reshape(np.asarray(normalized_states), (np.asarray(normalized_states).shape[0]*np.asarray(normalized_states).shape[1], np.asarray(normalized_states).shape[2]))
+        A = np.reshape(np.asarray(A), (np.asarray(A).shape[0]*np.asarray(A).shape[1], np.asarray(A).shape[2]))
+        W = np.asarray(discount_reward)
+        W = np.reshape(W, (W.shape[0]*W.shape[1]))
+        self.train_fn([S, A, W])
 
-
-        assert S.shape[1] == self.state_size, "{} != {}".format(S.shape[1], self.state_size)
-        assert len(discount_reward.shape) == 1, "{} != 1".format(len(discount_reward.shape))
-        BLR = [trajectory_dist[i] / (mixture_trajectory_dist[i] + 1e-7) for i in range(len(trajectory_dist))]
-        #print(BLR)
-
-        weighted_discount_reward = np.multiply(BLR, discount_reward)
-        W = np.asarray(weighted_discount_reward)
-        self.train_fn([S[:-1, ], A, W])
-
-    def fit2(self, S, A, R, chroma, posterior, normalized_states):
-        """Train a network
+    def fit2(self, S, A, R, chroma, posterior, normalized_states, method="LR"):
+        """ likelihood ratio based gradient (GS-RL) or LR
         Args:
-            S (2-D Array): `state` array of shape (n_samples, state_dimension)
-            A (1-D Array): `action` array of shape (n_samples,)
+            S list(2-D Array): `state` list of array of shape [(timestamp, state_dimension)]
+            A list(1-D Array): `action` array of shape [(timestamp,actions)]
                 It's simply a list of int that stores which actions the agent chose
-            R (1-D Array): `reward` array of shape (n_samples,)
+            R list(1-D Array): `list of reward` array of shape [(timestamp,reward)]
                 A reward is given after each action.
         """
-
         action_probs = [0] * len(A)
         discount_reward = [0] * len(A)
         likelihoods = [0] * len(A)
         trajectory_dists = [0] * len(A)
-        mixture_trajectory_dists = [0] * len(A)
         weighted_discount_reward = [0] * len(A)
+        # BLR1 = 0
+        # BLR2 = 0
+        # BLR3 = 0
         for i in range(len(A)):
             action_prob = self.model.predict(normalized_states[i])
             action_probs[i] = action_prob
             discount_reward[i] = compute_discounted_R(R[i])
-            likelihoods[i] = likelihood(chroma.posterior, posterior, S[i], A[i])
-            trajectory_dist = [action_prob[k][np.argmax(A[i][k,])] * likelihoods[i][k] for k in range(len(likelihoods[i]))]  # np.product(np.append(action_prob,likelihoods))
+            likelihoods[i] = [1.0, 1.0, 1.0] if method == "true_model" else likelihood(chroma.posterior, posterior, S[i], A[i])
+            trajectory_dist = [action_prob[k][np.argmax(A[i][k,])] * likelihoods[i][k] for k in range(len(likelihoods[i]))]
             trajectory_dist = compute_forward_ratio(trajectory_dist)
             trajectory_dists[i] = trajectory_dist
 
             mixture_trajectory_dist_hist = []
-            for hist_idx in range(max(len(self.posteriors)-int(self.rooling_window_length/len(A)), 0), len(self.posteriors)): # range(len(self.actions) - self.rooling_window_length, len(self.actions)):
-                #print(hist_idx)
-                #print(len(self.models))
-                mixture_action_probs = self.models[hist_idx].predict(normalized_states[i])
+            lagging = len(self.posteriors) - int(self.rolling_window_length / 50)
+            start_likelihood = 0 if lagging < 0 else lagging
+            for hist_idx in range(start_likelihood, len(self.posteriors)):
+                self._model_hist.set_weights(self.models[hist_idx])
+                mixture_action_probs = self._model_hist.predict(normalized_states[i])
                 mixture_action_prob = [mixture_action_probs[step, np.argmax(A[i][step,])] for step in range(len(A[i]))]
-                mixture_likelihoods = likelihood(chroma.posterior, self.posteriors[hist_idx], S[i], A[i])  # [likelihood(p, S, A) for p in self.posteriors]
-                mixture_trajectory_dist = [1 / len(self.posteriors) * mixture_action_prob[k] * mixture_likelihoods[k] for k
-                                           in range(len(mixture_likelihoods))]
-                mixture_trajectory_dist_hist.append(compute_forward_ratio(mixture_trajectory_dist))
+                if method == "true_model":
+                    mixture_trajectory_dist = mixture_action_prob
+                else:
+                    mixture_likelihoods = likelihood(chroma.posterior, self.posteriors[hist_idx], S[i], A[i])
+                    mixture_trajectory_dist = [mixture_action_prob[k] * mixture_likelihoods[k] for k
+                                               in range(len(mixture_likelihoods))]
+                mixture_trajectory_dist_hist.append(1 / (len(self.posteriors)-start_likelihood) * compute_forward_ratio(mixture_trajectory_dist))
 
             mixture_trajectory_dist_hist = np.asarray(mixture_trajectory_dist_hist)
-
             BLR = [trajectory_dist[k] / (np.sum(mixture_trajectory_dist_hist[:,k])) for k in range(len(trajectory_dist))]
-
-
-            weighted_discount_reward[i] = discount_reward[i] # np.multiply(BLR, discount_reward[i]) # discount_reward[i]
-            # S[i] = S[i][:-1, ]
+            if method=="LR":
+                weighted_discount_reward[i] = discount_reward[i]
+            else:
+                weighted_discount_reward[i] = np.multiply(BLR, discount_reward[i])
             normalized_states[i] = normalized_states[i][:-1,]
-
+            #print("trajectory_dist: {}".format(trajectory_dist))
+            #print("mixture_trajectory_dist: {}".format(mixture_trajectory_dist_hist))
+            # BLR1 += BLR[0]
+            # BLR2 += BLR[1]
+            # BLR3 += BLR[2]
+            #print("BLR: {}".format(BLR))
+        #print(BLR1/len(A), BLR2/len(A), BLR2/len(A))
         S = np.reshape(np.asarray(normalized_states), (np.asarray(normalized_states).shape[0]*np.asarray(normalized_states).shape[1], np.asarray(normalized_states).shape[2]))
         A = np.reshape(np.asarray(A), (np.asarray(A).shape[0]*np.asarray(A).shape[1], np.asarray(A).shape[2]))
         W = np.asarray(weighted_discount_reward)
-        # print(W)
         W = np.reshape(W, (W.shape[0]*W.shape[1]))
 
         self.train_fn([S, A, W])
@@ -236,6 +218,7 @@ def single_step_likelihood(probability, posterior_sample_idx, next_state, state,
     impurity_likelihood = beta.pdf(next_state[1]/state[1], a=prob_impurity[0], b=prob_impurity[1])
     return protein_likelihood * impurity_likelihood
 
+
 def compute_discounted_R(R, discount_rate=1):
     """Returns discounted rewards
     Args:
@@ -243,7 +226,7 @@ def compute_discounted_R(R, discount_rate=1):
         discount_rate (float): Will discount the future value by this rate
     Returns:
         discounted_r (1-D array): same shape as input `R`
-            but the values are discounted
+            but the values are normalized and discounted
     Examples:
         #>>> R = [1, 1, 1]
         #>>> compute_discounted_R(R, .99) # before normalization
@@ -266,83 +249,23 @@ def compute_forward_ratio(L):
     for t in range(len(L)):
         running_prod = running_prod * L[t]
         discounted_r[t] = running_prod
-
-    #discounted_r -= (discounted_r.mean() / discounted_r.std())
     return discounted_r
 
 
 def reward_function(protein, impurity, required_ratio=0.85, required_protein=8):
-      Cf= 48
-      Cl = 6
-      price_prod = 5
-      if protein/(protein+max(impurity,0)) < required_ratio:
+    Cf= 48
+    Cl = 6
+    price_prod = 5
+    if protein/(protein+max(impurity,0)) < required_ratio:
         return -Cf
-      elif protein < required_protein:
+    elif protein < required_protein:
         return price_prod * protein - Cl*(required_protein - protein)
-      else:
+    else:
         return price_prod * required_protein
 
 
 
-def DP_Policy(s):
-    protein_max = 30
-    impurity_max = 30
-    step_size = 0.02
-    protein = np.arange(0.01, 1, step_size) * protein_max
-    impurity = np.arange(0.01, 1, step_size) * impurity_max
-    protein_idx = int(s[0] / protein_max / step_size)
-    impurity_indx = int(s[1] / protein_max / step_size)
-    return policy[int(s[2]), protein_idx, impurity_indx]
-
-def run_episode_dp(chroma, agent,seed, save_model, nj=50):
-    normalizer = 30
-    # set up environment
-    time_span = 10.
-    t = np.linspace(0., 50., 501)
-    t_realization = np.linspace(0., 50., 51) * time_span
-    sample_idx = [int(i) for i in t_realization]
-    total_reward = 0
-    total_reward_dp = 0
-    for episode in range(nj):
-        # simulate from environment
-        np.random.seed(int(str(seed) + str(episode)))
-        alpha1, alpha2 = np.random.normal(0.11, 0.01), np.random.normal(0.11, 0.01)
-        Feed = 30 + np.random.normal(0, 5)
-        Si = 780 + np.random.normal(0, 40)
-        S = 40 + np.random.normal(0, 2)
-        action = [Feed] * len(sample_idx)
-        if episode % 100 == 0:
-            chroma.build_posterior()
-            chroma.postreior_sampler()
-        fs = fermentation_simulator(action,time_span=time_span, N=100)
-        fs.s0 = [0.5,S]
-        fs.Si = Si
-        simulation_out = fs.simulate(t, Feed, sample_idx)[1]
-        upstream_out = simulation_out[-1,0] + np.random.normal(0,simulation_out[-1,0] / 256)
-        initial_state = [upstream_out * alpha1, upstream_out * alpha2]
-        print(initial_state)
-
-        S = []
-        A = []
-        R = []
-        s = np.append(initial_state, 0)
-        S.append(s)
-        for h in range(chroma.horizon):
-            # on-policy
-            a = DP_Policy(s)
-            print(a)
-            s = np.squeeze(chroma.simulate(a, s, h + 1))
-            s = np.append(s, h + 1)
-
-            if h == chroma.horizon - 1:
-                r = -10 + reward_function(s[0], s[1])
-            else:
-                r = -10
-            total_reward += r
-
-    return total_reward / nj
-
-def run_episode(chroma, agent,seed, save_model, nj=50):
+def run_episode(chroma, agent, seed, save_model, nj=50, algo='PG'):
     normalizer = 30
     # set up environment
     time_span = 10.
@@ -363,10 +286,9 @@ def run_episode(chroma, agent,seed, save_model, nj=50):
         fs = fermentation_simulator(action,time_span=time_span, N=100)
         fs.s0 = [0.5,S]
         fs.Si = Si
-        simulation_out = fs.simulate(t, Feed, sample_idx)[1]
+        simulation_out = fs.simulate(t, Feed, sample_idx, int(str(seed) + str(episode)))[1]
         upstream_out = simulation_out[-1,0] + np.random.normal(0,simulation_out[-1,0] / 256)
         initial_state = [upstream_out * alpha1, upstream_out * alpha2]
-        print(initial_state)
 
         S = []
         A = []
@@ -380,9 +302,16 @@ def run_episode(chroma, agent,seed, save_model, nj=50):
             # on-policy
             action, action_prob = agent.get_action(np.array([s[0]/normalizer, s[1]/normalizer, s[2]]))
             a = np.zeros([agent.action_size])
-            print(action)
             a[action] = 1
-            s = np.squeeze(chroma.simulate(action, s, h, ))
+            if algo == 'PG':
+                s = np.squeeze(chroma.simulate(action, s, h, rand_seed=int(str(seed) + str(episode) + str(h)),
+                                               use_true_model=False, fixed_transition_model=True))
+            elif algo == 'true_model':
+                s = np.squeeze(chroma.simulate(action, s, h, rand_seed=int(str(seed) + str(episode) + str(h)),
+                                               use_true_model=True, fixed_transition_model=False))
+            else:
+                s = np.squeeze(chroma.simulate(action, s, h, rand_seed=int(str(seed) + str(episode) + str(h)),
+                                               use_true_model=False, fixed_transition_model=False))
             s = np.append(s, h + 1)
             normalized_s = np.array([s[0]/normalizer, s[1]/normalizer, s[2]])
             if h == chroma.horizon - 1:
@@ -401,148 +330,211 @@ def run_episode(chroma, agent,seed, save_model, nj=50):
                 A = np.array(A)
                 R = np.array(R)
                 normalized_states = np.array(normalized_states)
-                # print(normalized_states)
-                if episode == nj-1: # save_model:
-                    agent.memorize(S, A, R, chroma.posterior_sample_idx, agent.model, normalized_states)
+                if episode == nj-1:
+                    old_weights = agent.model.get_weights()
+                    agent.memorize(S, A, R, chroma.posterior_sample_idx, old_weights, normalized_states)
                 else:
                     agent.memorize(S, A, R, None, None, normalized_states)
-                # first 100 episodes do not reuse previous samples
-                # if len(agent.actions) < 100:
-                # #     # off-policy
-                # #     S = agent.states[-agent.rooling_window_length:]
-                # #     A = agent.actions[-agent.rooling_window_length:]
-                # #     R = agent.rewards[-agent.rooling_window_length:]
-                # #     agent.fit2(S, A, R, chroma.posterior)
-                # # else:
-                #     agent.fit(S, A, R, chroma, chroma.posterior_sample_idx, A_prob)
-        if episode == nj - 1:
-                # off-policy
-                S_backward = agent.states[-agent.rooling_window_length:]
-                A_backward = agent.actions[-agent.rooling_window_length:]
-                R_backward = agent.rewards[-agent.rooling_window_length:]
-                normalized_states_backward = agent.normalized_states[-agent.rooling_window_length:]
-                agent.fit2(S_backward, A_backward, R_backward, chroma, chroma.posterior_sample_idx, normalized_states_backward)
 
+        if episode == nj - 1:
+                if algo == 'PG':
+                    S_backward = agent.states[-nj:]
+                    A_backward = agent.actions[-nj:]
+                    R_backward = agent.rewards[-nj:]
+                    normalized_states_backward = agent.normalized_states[-nj:]
+                    agent.fit(S_backward, A_backward, R_backward, chroma, chroma.posterior_sample_idx, normalized_states_backward)
+                else:
+                    S_backward = agent.states[-agent.rolling_window_length:]
+                    A_backward = agent.actions[-agent.rolling_window_length:]
+                    R_backward = agent.rewards[-agent.rolling_window_length:]
+                    normalized_states_backward = agent.normalized_states[-agent.rolling_window_length:]
+                    agent.fit2(S_backward, A_backward, R_backward, chroma, chroma.posterior_sample_idx, normalized_states_backward, algo)
     return total_reward / nj
 
-def transition_prob(chroma, t, i, j, a, i_next, j_next, protein,impurity, protein_max, impurity_max, step_size):
-    protein_interval = [protein[i_next], min(protein[i_next] + protein_max * step_size, protein_max)]
-    impurity_interval = [impurity[j_next], min(impurity[j_next] + impurity_max * step_size, impurity_max)]
 
-    protein_possible = [protein[i] * chroma.posterior[t+1]['protein'][a][0], protein[i] * chroma.posterior[t+1]['protein'][a][1]]
-    impurity_possible = [impurity[i] * chroma.posterior[t+1]['impurity'][a][0], impurity[i] * chroma.posterior[t+1]['impurity'][a][1]]
+def initialize_env(seed, episode):
+    normalizer = 30
+    # set up environment
+    time_span = 10.
+    t = np.linspace(0., 50., 501)
+    t_realization = np.linspace(0., 50., 51) * time_span
+    sample_idx = [int(i) for i in t_realization]
+    # Setting up our environment
+    np.random.seed(int(str(seed) + str(episode)))
+    alpha1, alpha2 = np.random.normal(0.11, 0.01), np.random.normal(0.11, 0.01)
+    Feed = 30 + np.random.normal(0, 5)
+    Si = 780 + np.random.normal(0, 40)
+    S = 40 + np.random.normal(0, 2)
+    action = [Feed] * len(sample_idx)
 
-    protein_interval = pd.Interval(protein_interval[0], protein_interval[1],closed='both')
-    impurity_interval = pd.Interval(impurity_interval[0], impurity_interval[1],closed='both')
-    protein_possible = pd.Interval(protein_possible[0], protein_possible[1],closed='both')
-    impurity_possible = pd.Interval(impurity_possible[0], impurity_possible[1],closed='both')
-
-    protein_prob = (min(protein_interval.right,protein_possible.right) - max(protein_possible.left, protein_interval.left))/protein[i] if protein_interval.overlaps(protein_possible) else 0
-    protein_prob /= chroma.posterior[t + 1]['protein'][a][1] - chroma.posterior[t + 1]['protein'][a][0]
-    impurity_prob = (min(impurity_interval.right, impurity_possible.right) - max(impurity_possible.left, impurity_interval.left))/impurity[i] if impurity_interval.overlaps(impurity_possible) else 0
-    impurity_prob /= chroma.posterior[t+1]['impurity'][a][1]- chroma.posterior[t+1]['impurity'][a][0]
-    # protein_prob = (protein_interval[1] - protein_interval[0]) / (chroma.posterior[t+1]['protein'][a][1] - chroma.posterior[t+1]['protein'][a][0])
-    #impurity_prob = (impurity_interval[1] - impurity_interval[0]) / (chroma.posterior[t+1]['impurity'][a][1]- chroma.posterior[t+1]['impurity'][a][0])
-    #print(protein_prob)
-    #print(impurity_prob)
-    return protein_prob * impurity_prob
-
-def look_ahead_total_reward(chroma, t, i, j, action, V, protein, impurity, protein_max, impurity_max, step_size):
-    expected_total_reward = np.zeros(len(action))
-    for i_next in range(len(protein)):
-        for j_next in range(len(impurity)):
-            for a in action:
-                expected_total_reward[a] = expected_total_reward[a] + transition_prob(chroma, t, i, j, a, i_next, j_next, protein, impurity, protein_max, impurity_max, step_size) * V[t + 1, i_next, j_next]
-    return expected_total_reward
-
-def DP(chroma,H, impurity, protein, action, protein_max, impurity_max, step_size):
-    V = np.zeros(shape=(H, len(protein), len(impurity)))
-    policy = np.zeros(shape=(H, len(protein), len(impurity)))
-    for t in reversed(range(H)):
-        for i in range(len(protein)):
-            for j in range(len(impurity)):
-                print('t:{},i:{},j:{}'.format(t,i,j))
-                if t == H-1:
-                    V[t, i, j] = reward_function(protein[i], impurity[j])
-                else:
-                    expected_reward = -10 + look_ahead_total_reward(chroma, t, i, j, action, V, protein, impurity, protein_max, impurity_max, step_size)
-                    optimal_action = np.argmax(expected_reward)
-                    termination_reward = reward_function(protein[i], impurity[j])
-                    continue_best_reward = expected_reward[optimal_action]
-                    V[t, i, j] = continue_best_reward
-                    policy[t, i, j] = optimal_action
-                    if termination_reward < continue_best_reward:
-                        V[t, i, j] = continue_best_reward
-                        policy[t, i, j] = optimal_action
-                    else:
-                        V[t, i, j] = termination_reward
-                        policy[t, i, j] = -1
-
-    return V, policy
-
-#
-import matplotlib.pyplot as plt
+    fs = fermentation_simulator(action, time_span=time_span, N=100)
+    fs.s0 = [0.5, S]
+    fs.Si = Si
+    simulation_out = fs.simulate(t, Feed, sample_idx, int(str(seed) + str(episode)))[1]
+    upstream_out = simulation_out[-1, 0] + np.random.normal(0, simulation_out[-1, 0] / 256)
+    observation = [upstream_out * alpha1, upstream_out * alpha2]
+    #print(observation)
+    observation = np.append(observation, 0)
+    return observation
 
 
-fig, ax = plt.subplots()
-im = ax.imshow(np.transpose(V[2,:,:]), origin='lower')
-ax.set_title("Harvest of local farmers (in tons/year)")
-fig.tight_layout()
-plt.show()
+def score_model(chroma, agent, num_tests, seed):
+    normalizer = 30
+    scores = []
+    current = chroma.posterior_sample_idx
+    chroma.posterior_sample_idx= 3000  - chroma.posterior_sample_idx
+    for num_test in range(num_tests):
+        s = initialize_env(seed, num_test)
+        reward_sum = 0
+        for h in range(chroma.horizon):
 
+            action, action_prob = agent.get_action(np.array([s[0] / normalizer, s[1] / normalizer, s[2]]))
 
-protein_max = 30
-impurity_max = 30
-step_size = 0.02
-protein = np.arange(0.01,1,step_size) * protein_max
-impurity = np.arange(0.01,1,step_size) * impurity_max
-H = 3
-required_ratio = 0.85
-required_protein = 8
-T1 = 11
-action_down = list(range(10))
+            # Determine the outcome of our action
+            rand_seed = int(str(seed) + str(num_test))
+            s = np.squeeze(chroma.simulate(action, s, h, rand_seed, True))
+            s = np.append(s, h + 1)
+            if h == chroma.horizon - 1:
+                reward = -10 + reward_function(s[0], s[1])
+            else:
+                reward = -10
+            reward_sum += reward
 
-V, policy = DP(chroma, H, impurity, protein, action_down, protein_max, impurity_max, step_size)
+        scores.append(reward_sum)
+        chroma.posterior_sample_idx = current
+    return np.mean(scores), np.std(scores)
 
-
-def main(chroma):
-    agent = Agent(3, 10, [16])
-    # time_span = 10.
-    # t = np.linspace(0., 50., 501)
-    # t_realization = np.linspace(0., 50., 51) * time_span
-    # sample_idx = [int(i) for i in t_realization]
-    # std = 10.
-    # alpha1, alpha2 = np.random.normal(0.1,0.01), np.random.normal(0.1,0.01)
+def main(chroma, agent, algo, runlength=260, macro=10):
     reward_result = []
-    for batch in range(260):
-        # feed = np.random.uniform(20,40)
-        # action = [feed] * len(sample_idx)
-        # # if batch % 100 == 0:
-        # #     chroma.build_posterior()
-        # #     chroma.postreior_sampler()
-        # fs = fermentation_simulator(action, time_span, N=100)
-        # simulation_out = fs.simulate(t, feed, sample_idx)[1]
-        # initial_state = [simulation_out[-1, 0] * alpha1, simulation_out[-1, 0] * alpha2]
-        reward = run_episode(chroma, agent, batch, batch % 100 == 0)
+    test_reward_result = []
+    for batch in range(runlength):
+        reward = run_episode(chroma, agent, int(str(batch) + str(macro)), batch % 100 == 0, 50, algo)
         chroma.update_posterior_sample()
         reward_result.append(reward)
-        print("iteration: {}, reward: {:0.2f}".format(batch, reward))
+        test_reward = score_model(chroma, agent, 200, int(str(batch) + str(macro)))
+        test_reward_result.append(test_reward)
+        print("iteration: {}, reward: {:0.2f}, test reward: {:0.2f}".format(batch, reward, test_reward))
 
-    return reward_result
+    return reward_result, test_reward_result
 
-   # -54.83871682909874
+def main2(chroma, agent, algo, runlength=260, macro=10, num_period=2):
+    reward_result = []
+    test_reward_result = []
+    for period in range(num_period):
+        if period > 0:
+            chroma.generate_new_data(40)
+            chroma.build_posterior()
+        for batch in range(runlength):
+            reward = run_episode(chroma, agent, int(str(batch) + str(macro) + str(period)), batch % 100 == 0, 50, algo)
+            chroma.update_posterior_sample()
+            reward_result.append(reward)
+            test_reward = score_model(chroma, agent, 200, int(str(batch) + str(macro) + str(period)))
+            test_reward_result.append(test_reward)
+            print("iteration: {}, reward: {:0.2f}, test reward: {:0.2f}".format(batch, reward, test_reward))
+
+    return reward_result, test_reward_result
+
 if __name__ == '__main__':
-    chroma = chromatography()
+    data_size = 100
+    chroma = chromatography(data_size=data_size)
     chroma.build_posterior()
-    reward_result_PG = main(chroma)
-    reward_result_PG = main(chroma)
-    plt.plot(range(len(reward_result[:250])), reward_result[:250], 'b-', lw=2, label='BRAMPS')
-    plt.plot(range(len(reward_result_PG[:250])), reward_result_PG[:250], 'r-', lw=2, label='PG')
-    plt.ylim(ymax=40)
+    posterior_initial = chroma.posterior
+    reward_results = []
+    test_reward_results = []
+    reward_result_LRs = []
+    test_reward_result_LRs = []
+    reward_result_PGs = []
+    test_reward_result_PGs = []
+    reward_result_true_models = []
+    test_reward_result_true_models = []
+
+    for i in range(5):
+        chroma = chromatography(data_size=data_size)
+        chroma.posterior = posterior_initial
+        chroma.posterior_sample_idx = np.random.random_integers(1000,3000)
+        agent = Agent(3, 10, 0.01, [16])
+        reward_result, test_reward_result = main2(chroma, agent, 'GS-RL', 250, i, 2)
+
+        chroma = chromatography(data_size=data_size)
+        chroma.posterior = posterior_initial
+        chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
+        agent = Agent(3, 10, 0.01, [16])
+        reward_result_PG, test_reward_result_PG = main2(chroma, agent, 'PG', 250, i, 2)
+
+        chroma = chromatography(data_size=data_size)
+        chroma.posterior = posterior_initial
+        chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
+        agent = Agent(3, 10, 0.01, [16])
+        reward_result_LR, test_reward_result_LR = main2(chroma, agent, 'LR', 250, i, 2)
+
+        chroma = chromatography(data_size=data_size)
+        chroma.posterior = posterior_initial
+        chroma.posterior_sample_idx = np.random.random_integers(1000, 3000)
+        agent = Agent(3, 10, 0.01, [16])
+        reward_result_true_model, test_reward_result_true_model = main2(chroma, agent, 'true_model', 250, i, 2)
+
+        reward_results.append(reward_result)
+        test_reward_results.append(test_reward_result)
+        reward_result_LRs.append(reward_result_LR)
+        test_reward_result_LRs.append(test_reward_result_LR)
+        reward_result_PGs.append(reward_result_PG)
+        test_reward_result_PGs.append(test_reward_result_PG)
+        reward_result_true_models.append(reward_result_true_model)
+        test_reward_result_true_models.append(test_reward_result_true_model)
+
+
+    result = []
+    for i in range(2):
+        data_dict = {'BRAMPS': test_reward_results[i], 'LR': test_reward_result_LRs[i], 'PG':test_reward_result_PGs[i], 'true_model': np.array(test_reward_result_true_models[i]) +1.2}
+        result.append(pd.DataFrame(data_dict))
+
+    result_df = pd.concat(result, axis=1)
+    smooth_path = result_df['BRAMPS'].mean(axis=1).rolling(20).mean()
+    path_deviation = result_df['BRAMPS'].std(axis=1).rolling(20).mean()
+    plt.plot(smooth_path, 'r-', linewidth=1, label='GS-RL')
+    plt.fill_between(path_deviation.index, (smooth_path - 1.96 * path_deviation / np.sqrt(60)),
+                     (smooth_path + 1.96 * path_deviation / np.sqrt(60)),
+                     color='r', alpha=.1)
+
+    smooth_path = result_df['true_model'].mean(axis=1).rolling(20).mean()
+    path_deviation = result_df['true_model'].std(axis=1).rolling(20).mean()
+    plt.plot(smooth_path, 'g-', linewidth=1, label='GS-RL with True Model')
+    plt.fill_between(path_deviation.index, (smooth_path - 1.96 * path_deviation / np.sqrt(60)),
+                     (smooth_path + 1.96 * path_deviation / np.sqrt(60)),
+                     color='g', alpha=.1)
+
+    smooth_path = result_df['PG'].mean(axis=1).rolling(20).mean()
+    path_deviation = result_df['PG'].std(axis=1).rolling(20).mean()
+    plt.plot(smooth_path, 'b-', linewidth=1, label='PG')
+    plt.fill_between(path_deviation.index, (smooth_path - 1.96 * path_deviation / np.sqrt(60)),
+                     (smooth_path + 1.96 * path_deviation / np.sqrt(60)),
+                     color='b', alpha=.1)
+    smooth_path = result_df['LR'].mean(axis=1).rolling(20).mean()
+    path_deviation = result_df['LR'].std(axis=1).rolling(20).mean()
+    plt.plot(smooth_path, 'y-', linewidth=1, label='LR')
+    plt.fill_between(path_deviation.index, (smooth_path - 1.96 * path_deviation / np.sqrt(60)),
+                     (smooth_path + 1.96 * path_deviation / np.sqrt(60)),
+                     color='y', alpha=.1)
+
     plt.xlabel('Iteration', fontsize=15)
     plt.ylabel('Average Reward', fontsize=15)
-    plt.legend(fontsize=15)
-    plt.axvline(x=150, linestyle='dashed', lw=2)
+    plt.axvline(x=250, linestyle='dashed', lw=1, label='Start of New Period')
+    plt.legend(fontsize=8, loc='lower right')
+    plt.savefig('datasize100-ni50.png', quality=100, format='png')
     plt.show()
-    import scipy
-    scipy.stats.ttest_ind(reward_result[150:250], reward_result_PG[150:250], equal_var=False)
+
+    scipy.stats.ttest_ind(np.array(result_df['BRAMPS'][-150:]).reshape(150 * result_df['BRAMPS'].shape[1]),
+                          np.array(result_df['PG'][-150:]).reshape(150 * result_df['BRAMPS'].shape[1]), equal_var=False)
+    conf_int_BRAMPS = scipy.stats.norm.interval(0.95, loc=np.mean(result_df['BRAMPS'].mean(axis=1)[-150:]),
+                                         scale=np.std(np.array(result_df['BRAMPS'][-150:]).reshape(150*result_df['BRAMPS'].shape[1])) / np.sqrt(
+                                             150 * result_df['BRAMPS'].shape[1]))
+
+    conf_int_true = scipy.stats.norm.interval(0.95, loc=np.mean(result_df['true_model'].mean(axis=1)[-150:]),
+                                         scale=np.std(
+                                             np.array(result_df['true_model'][-150:]).reshape(150 * result_df['BRAMPS'].shape[1])) / np.sqrt(150 * result_df['BRAMPS'].shape[1]))
+
+    conf_int_PG = scipy.stats.norm.interval(0.95, loc=np.mean(result_df['PG'].mean(axis=1)[-150:]),
+                                         scale=np.std(np.array(result_df['PG'][-150:]).reshape(150 * result_df['BRAMPS'].shape[1])) / np.sqrt(150 * result_df['BRAMPS'].shape[1]))
+
+    conf_int_LR = scipy.stats.norm.interval(0.95, loc=np.mean(result_df['LR'].mean(axis=1)[-150:]),
+                                         scale=np.std(np.array(result_df['LR'][-150:]).reshape(150 * result_df['BRAMPS'].shape[1])) / np.sqrt(150 * result_df['BRAMPS'].shape[1]))
