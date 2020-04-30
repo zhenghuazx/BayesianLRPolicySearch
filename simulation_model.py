@@ -57,7 +57,8 @@ class fermentation_simulator:
         dS = self.feed_rate(t) / self.V * (self.Si - S) - q_s * X
         return [dX, dS]
 
-    def simulate(self, t, feed, sample_idx):
+    def simulate(self, t, feed, sample_idx, seed):
+        np.random.seed(seed)
         true_trajectories = scipy.integrate.odeint(self.bioreactor, self.s0, t, args=(feed,))
         substrate = true_trajectories[sample_idx, 1] + np.random.normal(0, self.std, true_trajectories[sample_idx, 1].shape)
         biomass = true_trajectories[sample_idx, 0] + np.random.normal(0, self.std, true_trajectories[sample_idx, 1].shape)
@@ -178,7 +179,7 @@ class chromatography:
         self.chrom2_protein = [self.get_alpha_beta(mu=purity, sigma=0.08 * purity_coef[0]) for purity in [(1 + pool / 12) * purity_coef[0] for pool in range(10)]]
         self.chrom2_impurity = [self.get_alpha_beta(mu=purity, sigma=0.08 * purity_coef[1]) for purity in [(1 + pool / 12) * purity_coef[1] for pool in range(10)]]
 
-        purity_coef = [0.5, 0.2]
+        purity_coef = [0.5, 0.22]
         self.chrom3_protein = [self.get_alpha_beta(mu=purity, sigma=0.08 * purity_coef[0]) for purity in [(1 + pool / 12) * purity_coef[0] for pool in range(10)]]
         self.chrom3_impurity = [self.get_alpha_beta(mu=purity, sigma=0.08 * purity_coef[1]) for purity in [(1 + pool / 12) * purity_coef[1] for pool in range(10)]]
 
@@ -214,26 +215,39 @@ class chromatography:
         with pm.Model() as model_g:
             # alpha = pm.TruncatedNormal(mu=3,sigma=2,lower=0.1,name='alpha')
             # beta = pm.TruncatedNormal(mu=7,sigma=2,lower=0.1,name='beta')
-            alpha = pm.Uniform(lower=0, upper=100, name='alpha')
-            beta = pm.Uniform(lower=0, upper=100, name='beta')
+            alpha = pm.Uniform(lower=0, upper=300, name='alpha')
+            beta = pm.Uniform(lower=0, upper=300, name='beta')
             y = pm.Beta('y', alpha=alpha, beta=beta, observed=data)
             trace_g = pm.sample(size, tune=1000, cores=4)
             #az.summary(trace_g)
         return np.array([trace_g.get_values('alpha'), trace_g.get_values('beta')]) # 2 * size
 
 
-    def simulate(self, window, initial_state, step, rand_seed=None):
+    def simulate(self, window, initial_state, step, rand_seed=None, use_true_model=False, fixed_transition_model=False):
         if self.posterior_sample_idx >= 4000:
             return
         if rand_seed == None:
             np.random.seed(int(str(window) + str(step) + str(int((initial_state[0] - int(initial_state[0])) * 10**6))))
         else:
             np.random.seed(rand_seed)
-        protein_param = self.posterior[step][0][window][:, self.posterior_sample_idx]
-        impurity_param = self.posterior[step][1][window][:, self.posterior_sample_idx]
 
-        removal_rate_protein = np.random.beta(protein_param[0], protein_param[1])
-        removal_rate_impurity = np.random.beta(impurity_param[0], impurity_param[1])
+        if use_true_model:
+            protein_param = self.true_model_params[step+1]['protein'][window]
+            impurity_param = self.true_model_params[step+1]['impurity'][window]
+            removal_rate_protein = np.random.beta(protein_param[0], protein_param[1])
+            removal_rate_impurity = np.random.beta(impurity_param[0], impurity_param[1])
+        elif fixed_transition_model:
+            protein_param = self.posterior[step][0][window][:, -1]
+            impurity_param = self.posterior[step][1][window][:, -1]
+            removal_rate_protein = np.random.beta(protein_param[0], protein_param[1])
+            removal_rate_impurity = np.random.beta(impurity_param[0], impurity_param[1])
+        else:
+            protein_param = self.posterior[step][0][window][:, self.posterior_sample_idx]
+            impurity_param = self.posterior[step][1][window][:, self.posterior_sample_idx]
+            removal_rate_protein = np.random.beta(protein_param[0], protein_param[1])
+            removal_rate_impurity = np.random.beta(impurity_param[0], impurity_param[1])
+
+
 
         protein = initial_state[0] * removal_rate_protein
         impurity = initial_state[1] * removal_rate_impurity
@@ -241,6 +255,8 @@ class chromatography:
         return state
 
     def build_posterior(self):
+        if len(self.posterior) != 0:
+            self.posterior = {}
         for i in range( self.horizon):
             actions = self.data_action[:, i]
             unique_actions = np.unique(actions)
@@ -254,18 +270,18 @@ class chromatography:
                     if i in self.posterior:
                         if j in self.posterior[i]:
                             self.posterior[i][j][a] = posteriors
-                            self.leftover_sample[i][j][a] = posteriors.shape[1] - 1
+                            #self.leftover_sample[i][j][a] = posteriors.shape[1] - 1
                         else:
                             self.posterior[i][j] = {a:posteriors}
-                            self.leftover_sample[i][j] = {a: posteriors.shape[1] - 1}
+                            #self.leftover_sample[i][j] = {a: posteriors.shape[1] - 1}
                     else:
                         self.posterior[i] = {j:{a:posteriors}}
-                        self.leftover_sample[i] = {j: {a: posteriors.shape[1] - 1}}
+                        #self.leftover_sample[i] = {j: {a: posteriors.shape[1] - 1}}
 
     def update_posterior_sample(self):
         self.posterior_sample_idx += 1
 
-    def generate_data(self, data_size=1000):
+    def generate_data(self,data_size=1000):
         time_span = 10.
         t = np.linspace(0., 50., 501)
         t_realization = np.linspace(0., 50., 51) * time_span
@@ -281,7 +297,7 @@ class chromatography:
             fs = fermentation_simulator(action, time_span=time_span, N=100)
             fs.s0 = [0.5, S]
             fs.Si = Si
-            simulation_out = fs.simulate(t, Feed, sample_idx)[1]
+            simulation_out = fs.simulate(t, Feed, sample_idx,  int(str(data_size) + str(i)))[1]
             upstream_out = simulation_out[-1, 0] + np.random.normal(0, simulation_out[-1, 0] / 256)
             state = [upstream_out * alpha1, upstream_out * alpha2]
             S = [state]
@@ -299,45 +315,7 @@ class chromatography:
             data_action.append(A)
         return np.array(data_state), np.array(data_action)
 
-
-if __name__ == '__main__':
-    feed = 10
-    time_span = 10.
-    t = np.linspace(0., 50., 501)
-    t_realization = np.linspace(0., 50., 51) * time_span
-    sample_idx = [int(i) for i in t_realization]
-    std = 10.
-    action = [feed] * len(sample_idx)
-
-
-    fs = fermentation_simulator(action, time_span,N=100)
-    simulation_out = fs.simulate(t, feed, sample_idx)[0]
-
-    fs.plot(t,feed,sample_idx)
-    plt.show()
-
-    result = fs.posterior_sampler(t, sample_idx, 2)
-    res = result.results
-    weights = np.exp(res['logwt'] - res['logz'][-1])
-    samples_dynesty = resample_equal(res.samples, weights)
-    fig, axes = dyplot.traceplot(result.results, truths=[0.3, 0.57,0.013],
-                                 show_titles=True, trace_cmap='viridis',
-                                 quantiles=None)
-    plt.show()
-
-    chroma = chromatography()
-    _, simulated_data = fs.simulate(t, feed, sample_idx)
-    initial_state = np.array([[simulated_data[-1, 0]*0.5, simulated_data[-1, 0] * 0.4], [simulated_data[-1, 0]*0.45, simulated_data[-1, 0]* 0.39]])
-    initial_state = np.array([[simulated_data[-1, 0]*0.5, simulated_data[-1, 0] * 0.4]])
-
-    chroma.simulate([1,2], 2,initial_state, False)
-    chroma.build_posterior()
-    chroma.postreior_sampler()
-    a,b = chroma.simulate([1, 2], 1, initial_state, True)
-    chroma.likelihood(np.array([[initial_state[0,0],initial_state[0,1]], [a[0,0],b[0,0]], [a[0,1],  b[0,1]]]), [1,2])
-    chroma.single_step_likelihood([a[0,1],  b[0,1]], [a[0,0],b[0,0]], 2,2)
-
-
-    chroma = chromatography()
-    chroma.build_posterior()
-    chroma.simulate(window=5, initial_state=[20,19], step=0)
+    def generate_new_data(self, data_size=40):
+        add_data_state, add_data_action = self.generate_data(data_size)
+        self.data_action = np.concatenate((self.data_action, add_data_action))
+        self.data_state = np.concatenate((self.data_state, add_data_state))
