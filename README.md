@@ -8,4 +8,4 @@
 
 Remark: the code was tested under tensorflow==1.14.0 and Keras==2.2.5. It may not support later version of tensorflow and Keras.
 
-The algorithms, simulation method and visualizations used in this package came primarily out of research in Xie Wei's lab at the Northeastern University. If you use Green simulation based policy search (GS-RL) in your research, we would appreciate a citation to the appropriate paper: [link](https://arxiv.org/abs/2006.09919).
+The algorithms, simulation method and visualizations used in this package came primarily out of research in Xie Wei's lab at the Northeastern University. If you use Green simulation based policy search (GS-RL) in your research, we would appreciate a citation to the appropriate [paper](https://arxiv.org/abs/2006.09919).
