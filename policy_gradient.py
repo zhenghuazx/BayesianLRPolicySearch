@@ -17,7 +17,7 @@ from random import sample
 class Agent(object):
 
     def __init__(self, input_dim, output_dim, learning_rate = 0.01, hidden_dims=[16, 32]):
-        """Gym Playing Agent
+        """
         Args:
             input_dim (int): the dimension of state.
                 Same as `env.observation_space.shape[0]`
