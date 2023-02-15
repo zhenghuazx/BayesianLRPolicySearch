@@ -61,6 +61,6 @@ Theano==1.0.4
 tqdm==4.36.1
 traitlets==4.3.3
 wcwidth==0.1.7
-Werkzeug==0.15.6
+Werkzeug==2.2.3
 wrapt==1.11.2
 xarray==0.15.1
